@@ -19,21 +19,22 @@ export default async function handler(req, res) {
 
     const rows = await sql`
       select
-        world_id,
-        object_id,
-        level,
-        cycle_started_at,
-        cycle_hours,
-        greatest(0, extract(epoch from (cycle_started_at + make_interval(hours => cycle_hours) - now())))::int as seconds_remaining,
+        o.world_id,
+        o.object_id,
+        o.level,
+        o.cycle_started_at,
+        o.cycle_hours,
+        greatest(0, extract(epoch from (o.cycle_started_at + make_interval(hours => o.cycle_hours) - now())))::int as seconds_remaining,
         (
           select count(*)::int
           from daily_evolution_clicks c
           where c.world_id = o.world_id
             and c.object_id = o.object_id
-            and c.cycle_started_at = o.cycle_started_at
+            and c.clicked_at >= o.cycle_started_at
+            and c.clicked_at < o.cycle_started_at + make_interval(hours => o.cycle_hours)
         ) as clicks
       from daily_evolution_objects o
-      where world_id = ${worldId} and object_id = ${objectId}
+      where o.world_id = ${worldId} and o.object_id = ${objectId}
       limit 1
     `;
 

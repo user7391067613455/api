@@ -1,5 +1,29 @@
 import { getSql, requireSecret, sendJson, requiredString, parsePositiveInt, parseNonNegativeInt } from './_db.js';
 
+async function getState(sql, worldId, objectId) {
+  const rows = await sql`
+    select
+      o.world_id,
+      o.object_id,
+      o.level,
+      o.cycle_started_at,
+      o.cycle_hours,
+      greatest(0, extract(epoch from (o.cycle_started_at + make_interval(hours => o.cycle_hours) - now())))::int as seconds_remaining,
+      (
+        select count(*)::int
+        from daily_evolution_clicks c
+        where c.world_id = o.world_id
+          and c.object_id = o.object_id
+          and c.clicked_at >= o.cycle_started_at
+          and c.clicked_at < o.cycle_started_at + make_interval(hours => o.cycle_hours)
+      ) as clicks
+    from daily_evolution_objects o
+    where o.world_id = ${worldId} and o.object_id = ${objectId}
+    limit 1
+  `;
+  return rows[0];
+}
+
 export default async function handler(req, res) {
   try {
     const auth = requireSecret(req);
@@ -26,7 +50,6 @@ export default async function handler(req, res) {
       where world_id = ${worldId} and object_id = ${objectId}
       limit 1
     `;
-
     let object = objectRows[0];
 
     const expiredRows = await sql`
@@ -42,8 +65,10 @@ export default async function handler(req, res) {
         from daily_evolution_clicks
         where world_id = ${worldId}
           and object_id = ${objectId}
-          and cycle_started_at = ${object.cycle_started_at}
+          and clicked_at >= ${object.cycle_started_at}
+          and clicked_at < ${object.cycle_started_at}::timestamptz + make_interval(hours => ${object.cycle_hours})
       `;
+
       const clicks = countRows[0].clicks;
       const nextLevel = clicks >= quota
         ? Math.min(maxLevel, object.level + 1)
@@ -63,56 +88,38 @@ export default async function handler(req, res) {
     `;
     object = objectRows[0];
 
-    let inserted = false;
-    try {
-      await sql`
-        insert into daily_evolution_clicks (world_id, object_id, cycle_started_at, player_id)
-        values (${worldId}, ${objectId}, ${object.cycle_started_at}, ${playerId})
-      `;
-      inserted = true;
-    } catch (e) {
-      inserted = false;
-    }
-
-    const countRows = await sql`
-      select count(*)::int as clicks
+    const alreadyRows = await sql`
+      select 1
       from daily_evolution_clicks
       where world_id = ${worldId}
         and object_id = ${objectId}
-        and cycle_started_at = ${object.cycle_started_at}
+        and player_id = ${playerId}
+        and clicked_at >= ${object.cycle_started_at}
+        and clicked_at < ${object.cycle_started_at}::timestamptz + make_interval(hours => ${object.cycle_hours})
+      limit 1
     `;
 
-    let clicks = countRows[0].clicks;
+    let inserted = false;
+    if (alreadyRows.length === 0) {
+      await sql`
+        insert into daily_evolution_clicks (world_id, object_id, cycle_started_at, player_id, clicked_at)
+        values (${worldId}, ${objectId}, ${object.cycle_started_at}, ${playerId}, now())
+      `;
+      inserted = true;
+    }
+
+    let state = await getState(sql, worldId, objectId);
     let levelChanged = false;
 
-    if (clicks >= quota && object.level < maxLevel) {
+    if (state.clicks >= quota && state.level < maxLevel) {
       await sql`
         update daily_evolution_objects
         set level = level + 1, cycle_started_at = now(), cycle_hours = ${cycleHours}, updated_at = now()
         where world_id = ${worldId} and object_id = ${objectId}
       `;
       levelChanged = true;
+      state = await getState(sql, worldId, objectId);
     }
-
-    const stateRows = await sql`
-      select
-        world_id,
-        object_id,
-        level,
-        cycle_started_at,
-        cycle_hours,
-        greatest(0, extract(epoch from (cycle_started_at + make_interval(hours => cycle_hours) - now())))::int as seconds_remaining,
-        (
-          select count(*)::int
-          from daily_evolution_clicks c
-          where c.world_id = o.world_id
-            and c.object_id = o.object_id
-            and c.cycle_started_at = o.cycle_started_at
-        ) as clicks
-      from daily_evolution_objects o
-      where world_id = ${worldId} and object_id = ${objectId}
-      limit 1
-    `;
 
     return sendJson(res, 200, {
       ok: true,
@@ -121,7 +128,7 @@ export default async function handler(req, res) {
       levelChanged,
       quota,
       maxLevel,
-      state: stateRows[0]
+      state
     });
   } catch (error) {
     return sendJson(res, 400, { ok: false, error: error.message });
